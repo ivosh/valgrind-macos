@@ -138,6 +138,7 @@ LIBVEX_SOURCES_COMMON = \
 	priv/main_globals.c \
 	priv/main_main.c \
 	priv/main_util.c \
+	priv/ir_cfg.c \
 	priv/ir_defs.c \
 	priv/ir_inject.c \
 	priv/ir_match.c \
