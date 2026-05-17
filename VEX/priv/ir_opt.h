@@ -51,6 +51,18 @@ IRSB* do_iropt_BB (
          VexArch guest_arch
       );
 
+/* CFG-based replacement for do_iropt_BB.  Same semantics, same signature. */
+extern
+IRSB *run_cfg_pipeline (
+      IRSB *bb,
+      IRExpr * (*specHelper)(const HChar *function_name, IRExpr **args, IRStmt **precedingStmts, Int n_precedingStmts),
+      Bool( *preciseMemExnsFn)(Int minoff, Int maxoff, VexRegisterUpdates pxControl),
+      VexRegisterUpdates pxControl,
+      Addr guest_addr,
+      VexArch guest_arch
+   );
+
+
 /* Do a constant folding/propagation pass. */
 extern
 IRSB* cprop_BB ( IRSB* );

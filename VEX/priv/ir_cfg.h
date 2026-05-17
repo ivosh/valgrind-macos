@@ -84,6 +84,11 @@ extern void addStmtToBlock(IRBlock *b, IRStmt *st);
 
 extern void addEdge(IRCFG *cfg, Int from, Int to);
 
+/* ---- Lift / Lower ---- */
+extern IRCFG *irsb_to_ircfg(const IRSB *bb);
+
+extern IRSB *ircfg_to_irsb(const IRCFG *cfg);
+
 /* ---- Debug / Sanity ---- */
 extern void ppIRCFG(const IRCFG *cfg);
 

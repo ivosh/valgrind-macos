@@ -560,6 +560,9 @@ typedef
       /* When false constant folding and algebric simplification is disabled.
          This is used in the iropt tester. */
       Bool iropt_fold_expr;
+      /* Replace do_iropt_BB with the CFG/phi-node pipeline.
+         Default: False. Set True once all optimization passes are adapted. */
+      Bool use_cfg_pipeline;
    }
    VexControl;
 

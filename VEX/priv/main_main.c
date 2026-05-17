@@ -205,6 +205,7 @@ void LibVEX_default_VexControl ( /*OUT*/ VexControl* vcon )
    vcon->guest_chase                    = True;
    vcon->regalloc_version               = 3;
    vcon->iropt_fold_expr                = True;
+   vcon->use_cfg_pipeline               = False;
 }
 
 void LibVEX_set_VexControl ( VexControl vcon )
@@ -683,9 +684,14 @@ IRSB* LibVEX_FrontEnd ( /*MOD*/ VexTranslateArgs* vta,
    vexAllocSanityCheck();
 
    /* Clean it up, hopefully a lot. */
-   irsb = do_iropt_BB ( irsb, specHelper, preciseMemExnsFn, *pxControl,
+   if (vex_control.use_cfg_pipeline) {
+      irsb = run_cfg_pipeline(irsb, specHelper, preciseMemExnsFn, *pxControl,
+                              vta->guest_bytes_addr, vta->arch_guest);
+   } else {
+      irsb = do_iropt_BB ( irsb, specHelper, preciseMemExnsFn, *pxControl,
                               vta->guest_bytes_addr,
                               vta->arch_guest );
+   }
 
    // JRS 2016 Aug 03: Sanity checking is expensive, we already checked
    // the output of the front end, and iropt never screws up the IR by

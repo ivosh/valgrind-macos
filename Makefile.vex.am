@@ -143,6 +143,7 @@ LIBVEX_SOURCES_COMMON = \
 	priv/ir_inject.c \
 	priv/ir_match.c \
 	priv/ir_opt.c \
+	priv/ir_opt_cfg.c \
 	priv/guest_generic_bb_to_IR.c \
 	priv/guest_generic_x87.c \
 	priv/guest_x86_helpers.c \

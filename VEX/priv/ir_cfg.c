@@ -136,6 +136,67 @@ void addEdge(IRCFG *cfg, Int from, Int to) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Lift/Lowers                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Split a flat IRSB at every Ist_Exit.  Each Ist_Exit becomes a block terminal; the fall-through is the only
+ * intra-CFG edge (the taken target of Ist_Exit leaves the IRCFG and is recorded in exit_stmt).
+ * K exits → K+1 blocks; block i → block i+1 (fall-through only).
+ */
+IRCFG *irsb_to_ircfg(const IRSB *bb) {
+    vassert(bb != NULL);
+    IRCFG *cfg = emptyIRCFG(deepCopyIRTypeEnv(bb->tyenv),
+                            deepCopyIRExpr(bb->next),
+                            bb->jumpkind, bb->offsIP);
+    IRBlock *curr = newIRBlock(cfg);
+
+    for (Int i = 0; i < bb->stmts_used; i++) {
+        IRStmt *st = bb->stmts[i];
+        if (st->tag == Ist_Exit) {
+            curr->exit_stmt = deepCopyIRStmt(st);
+            Int curr_idx = cfg->n_blocks - 1;
+            IRBlock *next = newIRBlock(cfg);
+            Int next_idx = cfg->n_blocks - 1;
+            addEdge(cfg, curr_idx, next_idx);
+            curr = next;
+        } else {
+            addStmtToBlock(curr, deepCopyIRStmt(st));
+        }
+    }
+    /* Last block: exit_stmt=NULL, n_succs=0 (set by newIRBlock defaults) */
+    sanityCheckIRCFG(cfg, "irsb_to_ircfg");
+    return cfg;
+}
+
+/*
+ * Linearize IRCFG back to a flat IRSB.  Blocks emitted in index order.
+ * Requires n_phis == 0 in every block (call lower_phi_nodes first).
+ */
+IRSB *ircfg_to_irsb(const IRCFG *cfg) {
+    vassert(cfg != NULL);
+
+    IRSB *bb = emptyIRSB();
+    bb->tyenv = deepCopyIRTypeEnv(cfg->tyenv);
+    bb->next = deepCopyIRExpr(cfg->final_next);
+    bb->jumpkind = cfg->final_jumpkind;
+    bb->offsIP = cfg->offsIP;
+
+    for (Int b = 0; b < cfg->n_blocks; b++) {
+        const IRBlock *blk = cfg->blocks[b];
+        vassert(blk->n_phis == 0);
+
+        for (Int i = 0; i < blk->stmts_used; i++) {
+            addStmtToIRSB(bb, deepCopyIRStmt(blk->stmts[i]));
+        }
+        if (blk->exit_stmt) {
+            addStmtToIRSB(bb, deepCopyIRStmt(blk->exit_stmt));
+        }
+    }
+    return bb;
+}
+
+/* ------------------------------------------------------------------ */
 /* ppIRCFG                                                            */
 /* ------------------------------------------------------------------ */
 
