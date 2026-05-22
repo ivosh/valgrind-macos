@@ -40,6 +40,9 @@ IRSB *run_cfg_pipeline(IRSB *bb,
                        VexArch guest_arch) {
     IRCFG *cfg = irsb_to_ircfg(bb);
     sanityCheckIRCFG(cfg, "run_cfg_pipeline:after_lift");
+    buildSSA(cfg);
+    lowerPhiNodes(cfg);
+    sanityCheckIRCFG(cfg, "run_cfg_pipeline:after_ssa_lower");
     return ircfg_to_irsb(cfg);
 }
 

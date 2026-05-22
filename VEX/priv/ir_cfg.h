@@ -89,6 +89,11 @@ extern IRCFG *irsb_to_ircfg(const IRSB *bb);
 
 extern IRSB *ircfg_to_irsb(const IRCFG *cfg);
 
+/* ---- SSA ---- */
+extern void buildSSA(IRCFG *cfg);
+
+extern void lowerPhiNodes(IRCFG *cfg);
+
 /* ---- Debug / Sanity ---- */
 extern void ppIRCFG(const IRCFG *cfg);
 

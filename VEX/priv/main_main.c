@@ -687,6 +687,10 @@ IRSB* LibVEX_FrontEnd ( /*MOD*/ VexTranslateArgs* vta,
    if (vex_control.use_cfg_pipeline) {
       irsb = run_cfg_pipeline(irsb, specHelper, preciseMemExnsFn, *pxControl,
                               vta->guest_bytes_addr, vta->arch_guest);
+      /* Remove this call when the CFG pipeline contains necessary optimization passes. */
+      irsb = do_iropt_BB ( irsb, specHelper, preciseMemExnsFn, *pxControl,
+                              vta->guest_bytes_addr,
+                              vta->arch_guest );
    } else {
       irsb = do_iropt_BB ( irsb, specHelper, preciseMemExnsFn, *pxControl,
                               vta->guest_bytes_addr,

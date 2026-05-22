@@ -197,6 +197,406 @@ IRSB *ircfg_to_irsb(const IRCFG *cfg) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Dominance                                                          */
+/* ------------------------------------------------------------------ */
+
+/* Iterative algorithm for computing immediate dominator.
+   Returns idom[0..n-1]; idom[0]=0 (entry dominates itself).
+   Requires blocks in reverse-postorder (irsb_to_ircfg guarantees this). */
+static Int *computeIDom(const IRCFG *cfg) {
+    Int n = cfg->n_blocks;
+    Int *idom = LibVEX_Alloc_inline(n * sizeof(Int));
+    for (Int i = 0; i < n; i++) idom[i] = -1;
+    idom[0] = 0;
+
+    Bool changed = True;
+    while (changed) {
+        changed = False;
+        for (Int b = 1; b < n; b++) {
+            const IRBlock *blk = cfg->blocks[b];
+            Int new_idom = -1;
+            for (Int pi = 0; pi < blk->n_preds; pi++) {
+                Int p = blk->preds[pi];
+                if (idom[p] == -1) {
+                    continue;
+                }
+                if (new_idom == -1) {
+                    new_idom = p;
+                    continue;
+                }
+                Int a = p, bb2 = new_idom;
+                while (a != bb2) {
+                    while (a > bb2) a = idom[a];
+                    while (bb2 > a) bb2 = idom[bb2];
+                }
+                new_idom = a;
+            }
+            if (new_idom != -1 && idom[b] != new_idom) {
+                idom[b] = new_idom;
+                changed = True;
+            }
+        }
+    }
+    return idom;
+}
+
+typedef struct {
+    Int **sets;
+    Int *counts;
+    Int *caps;
+    Int n;
+} DFSets;
+
+static void addDominanceFrontier(DFSets *df, Int b, Int j) {
+    Bool _found = False;
+    for (Int _k = 0; _k < df->counts[b]; _k++) {
+        if (df->sets[b][_k] == j) {
+            _found = True;
+            break;
+        }
+    }
+    if (!_found) {
+        if (df->counts[b] == df->caps[b]) {
+            Int *old = df->sets[b];
+            Int new_size = df->caps[b] * 2;
+            df->sets[b] = LibVEX_Alloc_inline(new_size * sizeof(Int));
+            for (Int i = 0; i < df->counts[b]; i++) {
+                df->sets[b][i] = old[i];
+            }
+            df->caps[b] = new_size;
+        }
+        df->sets[b][df->counts[b]++] = (j);
+    }
+}
+
+static DFSets computeDominanceFrontier(const IRCFG *cfg, const Int *idom) {
+    Int n = cfg->n_blocks;
+    DFSets df;
+    df.n = n;
+    df.sets = LibVEX_Alloc_inline(n * sizeof(Int *));
+    df.counts = LibVEX_Alloc_inline(n * sizeof(Int));
+    df.caps = LibVEX_Alloc_inline(n * sizeof(Int));
+    for (Int i = 0; i < n; i++) {
+        df.caps[i] = 4;
+        df.counts[i] = 0;
+        df.sets[i] = LibVEX_Alloc_inline(df.caps[i] * sizeof(Int));
+    }
+
+    /* For each join block j, walk up the dominator tree from each of its predecessors towards
+     * j's immediate dominator. */
+    for (Int j = 0; j < n; j++) {
+        if (cfg->blocks[j]->n_preds < 2) continue;
+        for (Int pi = 0; pi < cfg->blocks[j]->n_preds; pi++) {
+            Int runner = cfg->blocks[j]->preds[pi];
+            while (runner != idom[j]) {
+                addDominanceFrontier(&df, runner, j);
+                runner = idom[runner];
+            }
+        }
+    }
+    return df;
+}
+
+static void placePhiNodes(IRCFG *cfg, const DFSets *df) {
+    Int n = cfg->n_blocks;
+
+    /* Collect unique (offset, type) pairs appearing in any PUT statement, independent of aliased registers. */
+    Int max_pairs = 0;
+    for (Int b = 0; b < n; b++) {
+        const IRBlock *blk = cfg->blocks[b];
+        for (Int i = 0; i < blk->stmts_used; i++) {
+            if (blk->stmts[i]->tag == Ist_Put) max_pairs++;
+        }
+    }
+    if (max_pairs == 0) return;
+
+    Int *pair_off = LibVEX_Alloc_inline(max_pairs * sizeof(Int));
+    IRType *pair_ty = LibVEX_Alloc_inline(max_pairs * sizeof(IRType));
+    Int n_pairs = 0;
+    for (Int b = 0; b < n; b++) {
+        const IRBlock *blk = cfg->blocks[b];
+        for (Int i = 0; i < blk->stmts_used; i++) {
+            const IRStmt *st = blk->stmts[i];
+            if (st->tag != Ist_Put) continue;
+
+            Int off = st->Ist.Put.offset;
+            IRType ty = typeOfIRExpr(cfg->tyenv, st->Ist.Put.data);
+            Bool seen = False;
+            for (Int k = 0; k < n_pairs; k++) {
+                if (pair_off[k] == off && pair_ty[k] == ty) {
+                    seen = True;
+                    break;
+                }
+            }
+            if (!seen) {
+                pair_off[n_pairs] = off;
+                pair_ty[n_pairs] = ty;
+                n_pairs++;
+            }
+        }
+    }
+
+    /* For each definition site of (off, ty), place phis at its dominance frontier;
+       propagate frontier blocks as new definition sites and repeat. */
+    for (Int pi = 0; pi < n_pairs; pi++) {
+        Int off = pair_off[pi];
+        IRType ty = pair_ty[pi];
+
+        Bool *in_worklist = LibVEX_Alloc_inline(n * sizeof(Bool));
+        Bool *has_phi = LibVEX_Alloc_inline(n * sizeof(Bool));
+        for (Int b = 0; b < n; b++) {
+            in_worklist[b] = has_phi[b] = False;
+        }
+
+        Int *worklist = LibVEX_Alloc_inline(n * sizeof(Int));
+        Int worklist_length = 0;
+        for (Int b = 0; b < n; b++) {
+            const IRBlock *blk = cfg->blocks[b];
+            for (Int i = 0; i < blk->stmts_used; i++) {
+                const IRStmt *st = blk->stmts[i];
+                if (st->tag == Ist_Put &&
+                    st->Ist.Put.offset == off &&
+                    typeOfIRExpr(cfg->tyenv, st->Ist.Put.data) == ty) {
+                    if (!in_worklist[b]) {
+                        worklist[worklist_length++] = b;
+                        in_worklist[b] = True;
+                    }
+                    break;
+                }
+            }
+        }
+
+        for (Int w_idx = 0; w_idx < worklist_length; w_idx++) {
+            Int block = worklist[w_idx]; /* currently processed block */
+            for (Int k = 0; k < df->counts[block]; k++) {
+                Int d = df->sets[block][k]; /* join block in DF[block] - candidate phi site */
+                if (!has_phi[d] && cfg->blocks[d]->n_preds >= 2) {
+                    IRPhiNode *phi = newIRPhiNode(cfg->tyenv, ty, off, cfg->blocks[d]->n_preds);
+                    addPhiToBlock(cfg->blocks[d], phi);
+                    has_phi[d] = True;
+                    if (!in_worklist[d]) {
+                        worklist[worklist_length++] = d;
+                        in_worklist[d] = True;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Stack helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+#define MAX_GUEST_REG_STACKS 512
+#define MAX_STACK_DEPTH 256
+
+/* Guest registers can be accessed at the same offset with different widths. The key is (offset, type) tuple. */
+typedef struct {
+    Int off;
+    IRType ty;
+    IRTemp vals[MAX_STACK_DEPTH];
+    Int top;
+} GuestRegStack;
+
+/* Thread-safety note: g_stacks is a module-level mutable state, unlike the arena-allocated working state used by
+ * the rest of VEX. This is safe because Valgrind serializes all LibVEX_Translate calls through its scheduler - only
+ * one translation runs at a time. */
+static GuestRegStack g_stacks[MAX_GUEST_REG_STACKS];
+static Int g_n_stacks = 0;
+
+static void guestRegStacksReset(void) {
+    for (Int i = 0; i < g_n_stacks; i++) {
+        g_stacks[i].off = 0;
+        g_stacks[i].ty = Ity_INVALID;
+        g_stacks[i].top = 0;
+    }
+    g_n_stacks = 0;
+}
+
+static IRTemp guestRegStackTop(Int off, IRType ty) {
+    for (Int i = 0; i < g_n_stacks; i++) {
+        if (g_stacks[i].off == off && g_stacks[i].ty == ty && g_stacks[i].top > 0) {
+            return g_stacks[i].vals[g_stacks[i].top - 1];
+        }
+    }
+    return IRTemp_INVALID;
+}
+
+static void guestRegStackPush(Int off, IRType ty, IRTemp t) {
+    for (Int i = 0; i < g_n_stacks; i++) {
+        if (g_stacks[i].off == off && g_stacks[i].ty == ty) {
+            vassert(g_stacks[i].top < MAX_STACK_DEPTH);
+            g_stacks[i].vals[g_stacks[i].top++] = t;
+            return;
+        }
+    }
+    vassert(g_n_stacks < MAX_GUEST_REG_STACKS);
+
+    g_stacks[g_n_stacks].off = off;
+    g_stacks[g_n_stacks].ty = ty;
+    g_stacks[g_n_stacks].top = 0;
+    g_stacks[g_n_stacks].vals[g_stacks[g_n_stacks].top++] = t;
+    g_n_stacks++;
+}
+
+static void guestRegStackPop(Int off, IRType ty) {
+    for (Int i = 0; i < g_n_stacks; i++)
+        if (g_stacks[i].off == off && g_stacks[i].ty == ty) {
+            vassert(g_stacks[i].top > 0);
+            g_stacks[i].top--;
+            return;
+        }
+    vpanic("guestRegStackPop: guest register (offset, type) not found");
+}
+
+/* ------------------------------------------------------------------ */
+/* SSA                                                                */
+/* ------------------------------------------------------------------ */
+
+/* A depth-first walk of the dominator tree. Pushes definitions when entering a block, fills successor phi slots
+ * while definitions are live, recurses into children, pops on exit. */
+static void renameBlock(IRCFG *cfg, Int b, const Int *idom) {
+#define MAX_RENAMES 16384
+    Int *pushed_offs = LibVEX_Alloc_inline(MAX_RENAMES * sizeof(Int));
+    IRType *pushed_tys = LibVEX_Alloc_inline(MAX_RENAMES * sizeof(IRType));
+    Int n_pushed = 0;
+
+    IRBlock *blk = cfg->blocks[b];
+
+    /* Step 1: phi destinations - push onto stacks. */
+    for (Int i = 0; i < blk->n_phis; i++) {
+        IRPhiNode *phi = blk->phis[i];
+        IRType phi_ty = typeOfIRTemp(cfg->tyenv, phi->dst);
+        guestRegStackPush(phi->guest_off, phi_ty, phi->dst);
+        pushed_offs[n_pushed] = phi->guest_off;
+        pushed_tys[n_pushed] = phi_ty;
+        n_pushed++;
+    }
+
+    /* Step 2: rename statements. */
+    for (Int i = 0; i < blk->stmts_used; i++) {
+        IRStmt *st = blk->stmts[i];
+        if (st->tag == Ist_Put) {
+            /* PUT: keep in place; update stacks so subsequent renaming reflects the new guest-state contents. */
+            IRExpr *data = st->Ist.Put.data;
+            Int put_off = st->Ist.Put.offset;
+            IRType put_ty = typeOfIRExpr(cfg->tyenv, data);
+            Int put_sz = sizeofIRType(put_ty);
+            Int put_end = put_off + put_sz;
+            IRTemp to_push = (data->tag == Iex_RdTmp) ? data->Iex.RdTmp.tmp : IRTemp_INVALID;
+            guestRegStackPush(put_off, put_ty, to_push);
+            pushed_offs[n_pushed] = put_off;
+            pushed_tys[n_pushed] = put_ty;
+            n_pushed++;
+            /* Mark aliased registers as invalid. */
+            Int n_iter = g_n_stacks;
+            for (Int k = 0; k < n_iter; k++) {
+                if (g_stacks[k].off == put_off && g_stacks[k].ty == put_ty) {
+                    continue;
+                }
+                if (g_stacks[k].top == 0) {
+                    continue;
+                }
+                /* Already invalidated by an earlier overlapping write in this block. */
+                if (g_stacks[k].vals[g_stacks[k].top - 1] == IRTemp_INVALID) {
+                    continue;
+                }
+                Int k_off = g_stacks[k].off;
+                Int k_end = k_off + sizeofIRType(g_stacks[k].ty);
+                if (k_off < put_end && put_off < k_end) {
+                    guestRegStackPush(k_off, g_stacks[k].ty, IRTemp_INVALID);
+                    pushed_offs[n_pushed] = k_off;
+                    pushed_tys[n_pushed] = g_stacks[k].ty;
+                    n_pushed++;
+                }
+            }
+        } else if (st->tag == Ist_PutI || st->tag == Ist_Dirty) {
+            /* PutI/Dirty: can write any guest-state offset; invalidate every currently-live stack. */
+            Int n_iter = g_n_stacks;
+            for (Int k = 0; k < n_iter; k++) {
+                if (g_stacks[k].top > 0 && g_stacks[k].vals[g_stacks[k].top - 1] != IRTemp_INVALID) {
+                    Int off = g_stacks[k].off;
+                    IRType ty = g_stacks[k].ty;
+                    guestRegStackPush(off, ty, IRTemp_INVALID);
+                    pushed_offs[n_pushed] = off;
+                    pushed_tys[n_pushed] = ty;
+                    n_pushed++;
+                }
+            }
+        } else if (st->tag == Ist_WrTmp && st->Ist.WrTmp.data->tag == Iex_Get) {
+            /* WrTmp(t, GET(off)): replace GET with RdTmp only when the (offset, GET.ty) stack has a live definition. */
+            Int off = st->Ist.WrTmp.data->Iex.Get.offset;
+            IRType ty = st->Ist.WrTmp.data->Iex.Get.ty;
+            IRTemp top = guestRegStackTop(off, ty);
+            if (top != IRTemp_INVALID) {
+                st->Ist.WrTmp.data = IRExpr_RdTmp(top);
+            }
+        }
+    }
+
+    /* Step 3: fill phi operands in fall-through successors. */
+    for (Int succ_i = 0; succ_i < blk->n_succs; succ_i++) {
+        Int succ = blk->succs[succ_i];
+        IRBlock *succ_blk = cfg->blocks[succ];
+        Int pred_idx = -1;
+        for (Int pred_i = 0; pred_i < succ_blk->n_preds; pred_i++) {
+            if (succ_blk->preds[pred_i] == b) {
+                pred_idx = pred_i;
+                break;
+            }
+        }
+        vassert(pred_idx >= 0);
+
+        for (Int i = 0; i < succ_blk->n_phis; i++) {
+            IRPhiNode *phi = succ_blk->phis[i];
+            IRType phi_ty = typeOfIRTemp(cfg->tyenv, phi->dst);
+            IRTemp top = guestRegStackTop(phi->guest_off, phi_ty);
+            phi->vals[pred_idx] = (top != IRTemp_INVALID) ? top : IRTemp_INVALID;
+        }
+    }
+
+    /* Step 4: recurse on dominator-tree children */
+    for (Int c = 1; c < cfg->n_blocks; c++)
+        if (idom[c] == b && c != b) {
+            renameBlock(cfg, c, idom);
+            /* child pops its own pushes */
+        }
+
+    /* Step 5: pop all pushes made in this block (in reverse order) */
+    for (Int i = n_pushed - 1; i >= 0; i--) {
+        guestRegStackPop(pushed_offs[i], pushed_tys[i]);
+    }
+}
+
+void buildSSA(IRCFG *cfg) {
+    Int *idom = computeIDom(cfg);
+    DFSets df = computeDominanceFrontier(cfg, idom);
+    placePhiNodes(cfg, &df);
+    guestRegStacksReset();
+    renameBlock(cfg, 0, idom);
+    sanityCheckIRCFG(cfg, "buildSSA:after_rename");
+}
+
+/* Convert phi-nodes to parallel copies in predecessor blocks. */
+void lowerPhiNodes(IRCFG *cfg) {
+    for (Int b = 0; b < cfg->n_blocks; b++) {
+        IRBlock *blk = cfg->blocks[b];
+        if (blk->n_phis == 0) continue;
+        for (Int pi = 0; pi < blk->n_preds; pi++) {
+            IRBlock *pred = cfg->blocks[blk->preds[pi]];
+            for (Int i = 0; i < blk->n_phis; i++) {
+                const IRPhiNode *phi = blk->phis[i];
+                IRTemp src = phi->vals[pi];
+                if (src == IRTemp_INVALID) continue;
+                addStmtToBlock(pred, IRStmt_WrTmp(phi->dst, IRExpr_RdTmp(src)));
+            }
+        }
+        blk->n_phis = 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* ppIRCFG                                                            */
 /* ------------------------------------------------------------------ */
 
