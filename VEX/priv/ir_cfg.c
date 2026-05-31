@@ -648,11 +648,24 @@ void ppIRCFG(const IRCFG *cfg) {
 
 void sanityCheckIRCFG(const IRCFG *cfg, const HChar *caller) {
     vassert(cfg && cfg->n_blocks > 0 && cfg->tyenv);
+    vassert(cfg->final_next != NULL);
+
+    /* Entry block has no predecessors in a linear CFG. */
+    if (!cfg->has_back_edge) {
+        vassert(cfg->blocks[0]->n_preds == 0);
+    }
 
     for (Int b = 0; b < cfg->n_blocks; b++) {
         const IRBlock *blk = cfg->blocks[b];
-        vassert(blk->n_succs <= 2);
+        vassert(blk->n_succs >= 0 && blk->n_succs <= 2);
 
+        /* A block with Ist_Exit has the taken target outside the IRCFG. */
+        if (blk->exit_stmt) {
+            vassert(blk->exit_stmt->tag == Ist_Exit);
+            vassert(blk->n_succs >= 1);
+        }
+
+        /* Forward edge consistency: every succ lists b as a pred. */
         for (Int s = 0; s < blk->n_succs; s++) {
             Int c = blk->succs[s];
             vassert(c >= 0 && c < cfg->n_blocks);
@@ -670,12 +683,35 @@ void sanityCheckIRCFG(const IRCFG *cfg, const HChar *caller) {
                 vpanic("sanityCheckIRCFG: edge inconsistency");
             }
         }
+
+        /* Reverse edge consistency: every pred lists b as a successor. */
+        for (Int p = 0; p < blk->n_preds; p++) {
+            Int q = blk->preds[p];
+            vassert(q >= 0 && q < cfg->n_blocks);
+
+            const IRBlock *qblk = cfg->blocks[q];
+            Bool found = False;
+            for (Int s = 0; s < qblk->n_succs; s++) {
+                if (qblk->succs[s] == b) {
+                    found = True;
+                    break;
+                }
+            }
+            if (!found) {
+                vex_printf("sanityCheckIRCFG (%s): block %d<-%d pred inconsistency\n", caller, b, q);
+                vpanic("sanityCheckIRCFG: pred inconsistency");
+            }
+        }
+
         for (Int i = 0; i < blk->n_phis; i++) {
             const IRPhiNode *phi = blk->phis[i];
             if (phi->n_preds != blk->n_preds) {
                 vex_printf("sanityCheckIRCFG (%s): block %d phi n_preds mismatch\n", caller, b);
                 vpanic("sanityCheckIRCFG: phi/block pred count mismatch");
             }
+            /* Phi only meaningful at a join, and its destination must have a real type. */
+            vassert(blk->n_preds >= 2);
+            vassert(typeOfIRTemp(cfg->tyenv, phi->dst) != Ity_INVALID);
         }
     }
     /* The last block must have no successors in a linear CFG. */
