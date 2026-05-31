@@ -933,16 +933,3 @@
    fun:-[_CFXPreferences canLookUpAgents]
    ...
 }
-
-## __chkstk_darwin_probe stack probes
-#
-# dyld's __chkstk_darwin_probe intentionally reads single bytes below the current stack pointer to validate that stack
-# pages are committed. With the full IR optimizer these byte reads collapse into a pattern memcheck recognizes;
-# with un-optimized IR (--vex-iropt-level=0) probe surfaces as an Invalid read of size 1.
-# Remove after all CFG optimization passes are complete.
-{
-   OSX-arm64:__chkstk_darwin_probe
-   Memcheck:Addr1
-   fun:__chkstk_darwin_probe
-   ...
-}
